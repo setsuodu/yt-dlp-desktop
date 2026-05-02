@@ -8,7 +8,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+	<!-- 依赖包引用 -->
     <PackageReference Include="Microsoft.Playwright" Version="1.59.0" />
+
+	<!-- 文件拷贝配置 -->
+	<None Update="config.json">
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	</None>
   </ItemGroup>
 
 </Project>

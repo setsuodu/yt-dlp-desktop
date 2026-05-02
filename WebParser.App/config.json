@@ -1,0 +1,8 @@
+{
+  "VideoId": "2026446221",
+  "Name": "冻结地球",
+  "StartEp": 1,
+  "EndEp": 5,
+  "MaxConcurrent": 3,
+  "BaseUrl": "https://yhdm.one/vod-play/{id}/ep{ep}.html"
+}

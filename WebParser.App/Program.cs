@@ -1,31 +1,52 @@
 ﻿using Microsoft.Playwright;
 using System.Text.Json;
+using System.Diagnostics;
 
-var jsonString = await File.ReadAllTextAsync("config.json");
-var config = JsonSerializer.Deserialize<CrawlerConfig>(jsonString);
-if (config == null) return;
+// --- 1. 配置加载与优雅报错 ---
+const string ConfigName = "config.json";
+CrawlerConfig? config = null;
 
-string outputDir = $"{config.Name}_Data";
-if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
-
-using var playwright = await Playwright.CreateAsync();
-// 【改动】Headless 设为 false，让你能看到浏览器并手动点击验证码
-await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+try
 {
-    Headless = false,
-    SlowMo = 500 // 动作放慢点，更像真人
-});
+    if (!File.Exists(ConfigName))
+    {
+        Console.WriteLine($"❌ 错误: 找不到配置文件 '{ConfigName}'");
+        Console.WriteLine($"💡 请确保该文件位于程序运行目录下: {AppDomain.CurrentDomain.BaseDirectory}");
+        return;
+    }
 
-// 创建持久化上下文，这样点过一次验证码后，Cookie 会被记录，不用集集都点
+    var jsonString = await File.ReadAllTextAsync(ConfigName);
+    config = JsonSerializer.Deserialize<CrawlerConfig>(jsonString);
+
+    if (config == null) throw new Exception("配置文件格式非法（无法解析为 JSON）");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"❌ 程序初始化失败: {ex.Message}");
+    return;
+}
+
+// --- 2. 目录解构规范化 ---
+string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+string metadataDir = Path.Combine(baseDir, "Metadata", $"{config.Name}_Data");
+string videoDir = Path.Combine(baseDir, "Downloads", config.Name);
+
+Directory.CreateDirectory(metadataDir);
+Directory.CreateDirectory(videoDir);
+
+Console.WriteLine($"🚀 项目: {config.Name} | 目标: EP{config.StartEp} - EP{config.EndEp}");
+
+// --- 3. 阶段一：提取地址 (Playwright) ---
+using var playwright = await Playwright.CreateAsync();
+await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = false });
 var context = await browser.NewContextAsync(new BrowserNewContextOptions
 {
-    UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/104.1",
-    ViewportSize = new ViewportSize { Width = 375, Height = 667 }
+    UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/104.1"
 });
 
 for (int ep = config.StartEp; ep <= config.EndEp; ep++)
 {
-    string epFile = Path.Combine(outputDir, $"ep_{ep}.json");
+    string epFile = Path.Combine(metadataDir, $"ep_{ep}.json");
     if (File.Exists(epFile)) continue;
 
     var page = await context.NewPageAsync();
@@ -34,115 +55,74 @@ for (int ep = config.StartEp; ep <= config.EndEp; ep++)
         string url = config.BaseUrl.Replace("{id}", config.VideoId).Replace("{ep}", ep.ToString());
         await page.GotoAsync(url);
 
-        // 【关键】检测是否弹出了验证码
         if (await page.Locator("text=确认你不是机器人").IsVisibleAsync())
         {
-            Console.WriteLine($"⚠️ 第 {ep} 集卡验证码了！赶紧去浏览器里点一下那个按钮！");
-            // 死等，直到那个验证码弹窗消失
-            while (await page.Locator("text=确认你不是机器人").IsVisibleAsync())
-            {
-                await Task.Delay(1000);
-            }
-            Console.WriteLine("✅ 检测到验证通过，继续干活...");
+            Console.WriteLine($"⚠️ EP{ep} 等待手动过验证...");
+            while (await page.Locator("text=确认你不是机器人").IsVisibleAsync()) await Task.Delay(1000);
         }
 
-        // 等待列表加载
-        await page.WaitForSelectorAsync("ul#plays-ul li a", new() { State = WaitForSelectorState.Attached, Timeout = 30000 });
+        await page.WaitForSelectorAsync("ul#plays-ul li a", new() { Timeout = 10000 });
+        var links = await page.QuerySelectorAllAsync("ul#plays-ul li a");
+        var sources = new Dictionary<string, string>();
 
-        var sourceLinks = await page.QuerySelectorAllAsync("ul#plays-ul li a");
-        var epSources = new Dictionary<string, string>();
-
-        foreach (var link in sourceLinks)
+        foreach (var link in links)
         {
-            var sourceName = (await link.InnerTextAsync()).Trim();
+            var name = (await link.InnerTextAsync()).Trim();
             var href = await link.GetAttributeAsync("href");
             if (!string.IsNullOrEmpty(href) && href.Contains("http"))
-            {
-                epSources[sourceName] = href.Replace("/_player_x_/", "");
-            }
+                sources[name] = href.Replace("/_player_x_/", "");
         }
 
-        if (epSources.Count > 0)
+        if (sources.Count > 0)
         {
-            await File.WriteAllTextAsync(epFile, JsonSerializer.Serialize(epSources, new JsonSerializerOptions { WriteIndented = true }));
-            Console.WriteLine($"✅ EP{ep} 成功");
+            await File.WriteAllTextAsync(epFile, JsonSerializer.Serialize(sources, new JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"✅ [Metadata] EP{ep} 地址提取成功");
         }
     }
-    catch (Exception ex) { Console.WriteLine($"❌ EP{ep} 报错: {ex.Message}"); }
+    catch (Exception ex) { Console.WriteLine($"❌ EP{ep} 抓取异常: {ex.Message}"); }
     finally { await page.CloseAsync(); }
 }
+await browser.CloseAsync();
 
-// 汇总逻辑同上...
-Console.WriteLine("🎉 搞定，去看 full_sources.json 吧。");
+// --- 4. 阶段二：多源轮询下载 (yt-dlp) ---
+Console.WriteLine("\n📡 准备进入下载流...");
+var downloadOptions = new ParallelOptions { MaxDegreeOfParallelism = config.MaxConcurrent };
 
-// --- 功能 2：自动化下载与多源容灾 ---
-Console.WriteLine("\n开始扫描并下载视频文件...");
-
-for (int ep = config.StartEp; ep <= config.EndEp; ep++)
+await Parallel.ForEachAsync(Enumerable.Range(config.StartEp, config.EndEp - config.StartEp + 1), downloadOptions, async (ep, ct) =>
 {
-    string epFile = Path.Combine(outputDir, $"ep_{ep}.json");
-    if (!File.Exists(epFile)) continue;
+    string epFile = Path.Combine(metadataDir, $"ep_{ep}.json");
+    string fileName = Path.Combine(videoDir, $"{config.Name} - {ep:D2}.mp4");
 
-    // 读取该集的所有可用源
-    var jsonContent = await File.ReadAllTextAsync(epFile);
-    var epSources = JsonSerializer.Deserialize<Dictionary<string, string>>(jsonContent);
+    if (File.Exists(fileName) && new FileInfo(fileName).Length > 1024 * 1024) return;
 
-    if (epSources == null || epSources.Count == 0) continue;
+    if (!File.Exists(epFile)) return;
+    var sources = JsonSerializer.Deserialize<Dictionary<string, string>>(await File.ReadAllTextAsync(epFile));
+    if (sources == null) return;
 
-    bool downloadSuccess = false;
-    string fileName = $"{config.Name} - {ep:D2}.mp4"; // 格式化文件名
-
-    // 依次尝试每一个 m3u8 地址
-    foreach (var source in epSources)
+    foreach (var source in sources)
     {
-        Console.WriteLine($"[EP{ep}] 尝试使用源 {source.Key}: {source.Value}");
-
-        // 调用 yt-dlp 进行下载
-        if (await TryDownloadWithYtDlp(source.Value, fileName))
-        {
-            Console.WriteLine($"[EP{ep}] ✅ 下载成功 (源: {source.Key})");
-            downloadSuccess = true;
-            break; // 成功则跳出，处理下一集
-        }
-        else
-        {
-            Console.WriteLine($"[EP{ep}] ❌ 源 {source.Key} 失效，尝试下一个...");
-        }
+        Console.WriteLine($"[EP{ep}] 尝试源: {source.Key}");
+        if (await RunYtDlp(source.Value, fileName)) break;
     }
+});
 
-    if (!downloadSuccess)
-    {
-        Console.WriteLine($"[EP{ep}] ⚠️ 所有源均已尝试，下载失败。");
-    }
-}
-
-// 封装 yt-dlp 调用
-async Task<bool> TryDownloadWithYtDlp(string m3u8Url, string outputName)
+async Task<bool> RunYtDlp(string url, string output)
 {
-    var startInfo = new System.Diagnostics.ProcessStartInfo
+    var startInfo = new ProcessStartInfo
     {
         FileName = "yt-dlp",
-        // 参数说明:
-        // -o: 输出文件名
-        // --fragment-retries: 单个分片重试次数
-        // --check-formats: 下载前检查链接有效性
-        Arguments = $"\"{m3u8Url}\" -o \"{outputName}\" --concurrent-fragments 5 --fragment-retries 3",
+        Arguments = $"\"{url}\" -o \"{output}\" --concurrent-fragments 5",
         UseShellExecute = false,
         CreateNoWindow = false
     };
-
     try
     {
-        using var process = System.Diagnostics.Process.Start(startInfo);
-        if (process == null) return false;
-
-        await process.WaitForExitAsync();
-        return process.ExitCode == 0; // 退出码为 0 表示成功
+        using var p = Process.Start(startInfo);
+        if (p == null) return false;
+        await p.WaitForExitAsync();
+        return p.ExitCode == 0;
     }
-    catch
-    {
-        return false;
-    }
+    catch { return false; }
 }
 
 public record CrawlerConfig(string VideoId, string Name, int StartEp, int EndEp, int MaxConcurrent, string BaseUrl);
